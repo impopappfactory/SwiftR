@@ -53,9 +53,15 @@ public final class SwiftR: NSObject {
     public static var transport: Transport = .Auto
 
     public class func connect(url: String, connectionType: ConnectionType = .Hub, readyHandler: SignalR -> ()) -> SignalR? {
-        let signalR = SignalR(baseUrl: url, connectionType: connectionType, readyHandler: readyHandler)
-        connections.append(signalR)
-        return signalR
+        if #available(iOS 8.0, *) {
+            let signalR = SignalR_iOS8(baseUrl: url, connectionType: connectionType, readyHandler: readyHandler)
+            connections.append(signalR)
+            return signalR
+        } else {
+            let signalR = SignalR_iOS7(baseUrl: url, connectionType: connectionType, readyHandler: readyHandler)
+            connections.append(signalR)
+            return signalR
+        }
     }
 
     public class func startAll() {
@@ -117,8 +123,256 @@ public final class SwiftR: NSObject {
     }
 }
 
+public protocol SignalR: class {
+    var state: State { get set }
+    var connectionID: String? { get set }
+    var received: (AnyObject? -> ())? { get set }
+    var starting: (() -> ())? { get set }
+    var connected: (() -> ())? { get set }
+    var disconnected: (() -> ())? { get set }
+    var connectionSlow: (() -> ())? { get set }
+    var connectionFailed: (() -> ())? { get set }
+    var reconnecting: (() -> ())? { get set }
+    var reconnected: (() -> ())? { get set }
+    var error: (AnyObject? -> ())? { get set }
+    var queryString: AnyObject? { get set }
+    var headers: [String: String]? { get set }
+    var customUserAgent: String? { get set }
+
+    func createHubProxy(name: String) -> Hub
+    func send(data: AnyObject?)
+    func start()
+    func stop()
+
+    func runJavaScript(script: String, callback: (AnyObject! -> ())?)
+}
+
+public class SignalR_iOS7: NSObject, SignalR, SwiftRWebDelegate_iOS7 {
+    var webView: SwiftRWebView!
+
+    var baseUrl: String
+    var connectionType: ConnectionType
+
+    var readyHandler: SignalR -> ()
+    var hubs = [String: Hub]()
+
+    public var state: State = .Disconnected
+    public var connectionID: String?
+    public var received: (AnyObject? -> ())?
+    public var starting: (() -> ())?
+    public var connected: (() -> ())?
+    public var disconnected: (() -> ())?
+    public var connectionSlow: (() -> ())?
+    public var connectionFailed: (() -> ())?
+    public var reconnecting: (() -> ())?
+    public var reconnected: (() -> ())?
+    public var error: (AnyObject? -> ())?
+
+    public var queryString: AnyObject? {
+        didSet {
+            if let qs: AnyObject = queryString {
+                if let jsonData = try? NSJSONSerialization.dataWithJSONObject(qs, options: NSJSONWritingOptions()) {
+                    let json = NSString(data: jsonData, encoding: NSUTF8StringEncoding) as! String
+                    runJavaScript("swiftR.connection.qs = \(json)")
+                }
+            } else {
+                runJavaScript("swiftR.connection.qs = {}")
+            }
+        }
+    }
+
+    public var headers: [String: String]? {
+        didSet {
+            if let h = headers {
+                if let jsonData = try? NSJSONSerialization.dataWithJSONObject(h, options: NSJSONWritingOptions()) {
+                    let json = NSString(data: jsonData, encoding: NSUTF8StringEncoding) as! String
+                    runJavaScript("swiftR.headers = \(json)")
+                }
+            } else {
+                runJavaScript("swiftR.headers = {}")
+            }
+        }
+    }
+
+    public var customUserAgent: String? {
+        didSet {
+            #if os(iOS)
+                print("Unable to set user agent for UIWebView. Please register defaults via NSUserDefaults instead.")
+            #else
+                webView.customUserAgent = customUserAgent
+            #endif
+        }
+    }
+
+    init(baseUrl: String, connectionType: ConnectionType = .Hub, readyHandler: SignalR -> ()) {
+        self.baseUrl = baseUrl
+        self.readyHandler = readyHandler
+        self.connectionType = connectionType
+        super.init()
+
+        #if COCOAPODS
+            let bundle = NSBundle(identifier: "org.cocoapods.SwiftR")!
+        #elseif SWIFTR_FRAMEWORK
+            let bundle = NSBundle(identifier: "com.adamhartford.SwiftR")!
+        #else
+            let bundle = NSBundle.mainBundle()
+        #endif
+
+        let jqueryURL = bundle.URLForResource("jquery-2.1.3.min", withExtension: "js")!
+        let signalRURL = bundle.URLForResource("jquery.signalr-\(SwiftR.signalRVersion).min", withExtension: "js")!
+        let jsURL = bundle.URLForResource("SwiftR", withExtension: "js")!
+
+
+        let jqueryInclude = "<script src='\(jqueryURL.absoluteString)'></script>"
+        let signalRInclude = "<script src='\(signalRURL.absoluteString)'></script>"
+        let jsInclude = "<script src='\(jsURL.absoluteString)'></script>"
+
+        let html = "<!doctype html><html><head></head><body>"
+            + "\(jqueryInclude)\(signalRInclude)\(jsInclude)"
+            + "</body></html>"
+
+        webView = SwiftRWebView()
+        #if os(iOS)
+            webView.delegate = self
+            webView.loadHTMLString(html, baseURL: bundle.bundleURL)
+        #else
+            webView.policyDelegate = self
+            webView.mainFrame.loadHTMLString(html, baseURL: bundle.bundleURL)
+        #endif
+    }
+
+    public func createHubProxy(name: String) -> Hub {
+        let hub = Hub(name: name, connection: self)
+        hubs[name.lowercaseString] = hub
+        return hub
+    }
+
+    public func send(data: AnyObject?) {
+        var json = "null"
+        if let d: AnyObject = data {
+            if let val = SwiftR.stringify(d) {
+                json = val
+            }
+        }
+        runJavaScript("swiftR.connection.send(\(json))")
+    }
+
+    public func start() {
+        runJavaScript("start()")
+    }
+
+    public func stop() {
+        runJavaScript("swiftR.connection.stop()")
+    }
+
+    func shouldHandleRequest(request: NSURLRequest) -> Bool {
+        if request.URL!.absoluteString.hasPrefix("swiftr://") {
+            let id = (request.URL!.absoluteString as NSString).substringFromIndex(9)
+            let msg = webView.stringByEvaluatingJavaScriptFromString("readMessage('\(id)')")!
+            let data = msg.dataUsingEncoding(NSUTF8StringEncoding, allowLossyConversion: false)!
+            let json: AnyObject = try! NSJSONSerialization.JSONObjectWithData(data, options: [])
+
+            processMessage(json)
+
+            return false
+        }
+
+        return true
+    }
+
+    func processMessage(json: AnyObject) {
+        if let message = json["message"] as? String {
+            switch message {
+            case "ready":
+                let isHub = connectionType == .Hub ? "true" : "false"
+                runJavaScript("swiftR.transport = '\(SwiftR.transport.stringValue)'")
+                runJavaScript("initialize('\(baseUrl)', \(isHub))")
+                readyHandler(self)
+                runJavaScript("start()")
+            case "starting":
+                state = .Connecting
+                starting?()
+            case "connected":
+                state = .Connected
+                connectionID = json["connectionId"] as? String
+                connected?()
+            case "disconnected":
+                state = .Disconnected
+                disconnected?()
+            case "connectionSlow":
+                connectionSlow?()
+            case "connectionFailed":
+                connectionFailed?()
+            case "reconnecting":
+                state = .Connecting
+                reconnecting?()
+            case "reconnected":
+                state = .Connected
+                reconnected?()
+            case "invokeHandler":
+                let hubName = json["hub"] as! String
+                if let hub = hubs[hubName] {
+                    let uuid = json["id"] as! String
+                    let result = json["result"]
+                    let error = json["error"] as AnyObject?
+                    if let callback = hub.invokeHandlers[uuid] {
+                        callback(result: result, error: error)
+                        hub.invokeHandlers.removeValueForKey(uuid)
+                    } else if let e = error {
+                        print("SwiftR invoke error: \(e)")
+                    }
+                }
+            case "error":
+                if let err: AnyObject = json["error"] {
+                    error?(err)
+                } else {
+                    error?(nil)
+                }
+            default:
+                break
+            }
+        } else if let data: AnyObject = json["data"] {
+            received?(data)
+        } else if let hubName = json["hub"] as? String {
+            let callbackID = json["id"] as? String
+            let method = json["method"] as? String
+            let arguments = json["arguments"] as? [AnyObject]
+            let hub = hubs[hubName]
+
+            if let method = method, callbackID = callbackID, handlers = hub?.handlers[method], handler = handlers[callbackID] {
+                handler(arguments)
+            }
+        }
+    }
+
+    public func runJavaScript(script: String, callback: (AnyObject! -> ())? = nil) {
+        let result = webView.stringByEvaluatingJavaScriptFromString(script)
+        callback?(result)
+    }
+
+    // MARK: - Web delegate methods
+
+    #if os(iOS)
+    public func webView(webView: UIWebView, shouldStartLoadWithRequest request: NSURLRequest, navigationType: UIWebViewNavigationType) -> Bool {
+        return shouldHandleRequest(request)
+    }
+    #else
+
+    public func webView(webView: WebView!,
+                        decidePolicyForNavigationAction actionInformation: [NSObject : AnyObject]!,
+                                                        request: NSURLRequest!,
+                                                        frame: WebFrame!,
+                                                        decisionListener listener: WebPolicyDecisionListener!) {
+
+        if shouldHandleRequest(request) {
+            listener.use()
+        }
+    }
+    #endif
+}
+
 @available(iOS 8.0, *)
-public class SignalR: NSObject, SwiftRWebDelegate {
+public class SignalR_iOS8: NSObject, SignalR, SwiftRWebDelegate_iOS8 {
     var webView: SwiftRWebView!
     var wkWebView: WKWebView!
 
@@ -406,7 +660,7 @@ public class SignalR: NSObject, SwiftRWebDelegate {
         }
     }
 
-    func runJavaScript(script: String, callback: (AnyObject! -> ())? = nil) {
+    public func runJavaScript(script: String, callback: (AnyObject! -> ())? = nil) {
         if SwiftR.useWKWebView {
             wkWebView.evaluateJavaScript(script, completionHandler: { (result, _)  in
                 callback?(result)
@@ -484,7 +738,7 @@ public class Hub {
         }
 
         handlers[method]?[callbackID] = callback
-        connection.runJavaScript("addHandler('\(callbackID)', '\(name)', '\(method)')")
+        connection.runJavaScript("addHandler('\(callbackID)', '\(name)', '\(method)')", callback: nil)
     }
 
     public func invoke(method: String, arguments: [AnyObject]? = nil, callback: ((result: AnyObject?, error: AnyObject?) -> ())? = nil) {
@@ -513,7 +767,7 @@ public class Hub {
             ? "ensureHub('\(name)').invoke('\(method)').done(\(doneJS)).fail(\(failJS))"
             : "ensureHub('\(name)').invoke('\(method)', \(args)).done(\(doneJS)).fail(\(failJS))"
 
-        connection.runJavaScript(js)
+        connection.runJavaScript(js, callback: nil)
     }
 
 }
@@ -544,7 +798,12 @@ public enum SignalRVersion: CustomStringConvertible {
 
 #if os(iOS)
     typealias SwiftRWebView = UIWebView
-    public protocol SwiftRWebDelegate: WKNavigationDelegate, WKScriptMessageHandler, UIWebViewDelegate {}
+
+    @available (iOS 8.0, *)
+    public protocol SwiftRWebDelegate_iOS8: WKNavigationDelegate, WKScriptMessageHandler, UIWebViewDelegate {}
+
+    public protocol SwiftRWebDelegate_iOS7: UIWebViewDelegate {}
+
 #else
     typealias SwiftRWebView = WebView
     public protocol SwiftRWebDelegate: WKNavigationDelegate, WKScriptMessageHandler, WebPolicyDelegate {}
